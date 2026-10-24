@@ -645,3 +645,7 @@ Key residual risks:
 - Unsigned installers until release-signing certificates are configured.
 
 There is deliberately no master-password reset or server-held recovery route. Losing both the master password and recovery file makes the vault unrecoverable. This project has not undergone a real independent cryptographic audit.
+
+## License
+
+Lockit is open source under the [MIT License](LICENSE).
