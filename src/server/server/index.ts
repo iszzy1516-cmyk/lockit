@@ -138,6 +138,8 @@ function validateBundle(value: unknown): asserts value is KeyBundle {
   validateSecretBox(value.encryptedIdentitySecret, 80);
   decodeBase64(value.vaultPublicKey, 32);
   validateSecretBox(value.encryptedVaultSecret, 48);
+  validateSecretBox(value.encryptedRecoveryIdentitySecret, 80);
+  validateSecretBox(value.encryptedRecoveryVaultSecret, 48);
   decodeBase64(value.sealedVaultKey, 80);
 }
 

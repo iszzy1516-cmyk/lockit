@@ -48,6 +48,8 @@ function makeBundle(publicKey?: Buffer): KeyBundle {
     encryptedIdentitySecret: { nonce: encoded(24), ciphertext: encoded(80) },
     vaultPublicKey: encoded(32),
     encryptedVaultSecret: { nonce: encoded(24), ciphertext: encoded(48) },
+    encryptedRecoveryIdentitySecret: { nonce: encoded(24), ciphertext: encoded(80) },
+    encryptedRecoveryVaultSecret: { nonce: encoded(24), ciphertext: encoded(48) },
     sealedVaultKey: encoded(80),
   };
 }
@@ -178,6 +180,10 @@ describe('Lockit server', () => {
     })).status, 400);
     assert.equal((await request('/api/register', {
       body: { ...account.bundle, salt: encoded(15), email: 'bad-salt@example.com' },
+    })).status, 400);
+    const { encryptedRecoveryIdentitySecret: _missingRecovery, ...missingRecovery } = account.bundle;
+    assert.equal((await request('/api/register', {
+      body: { ...missingRecovery, email: 'bad-recovery@example.com' },
     })).status, 400);
 
     const bundleResponse = await request('/api/auth/bundle', { cookie: account.cookie });

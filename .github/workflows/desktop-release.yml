@@ -41,6 +41,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential curl wget file libxdo-dev libssl-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: npm ci
+      - name: Install Windows native packages
+        if: runner.os == 'Windows'
+        run: npm install --no-save --include=optional @rollup/rollup-win32-x64-msvc@4.65.0 @tauri-apps/cli-win32-x64-msvc@2.12.4
       - run: npm run build
       - run: npm run desktop:prepare
         env:

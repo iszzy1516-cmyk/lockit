@@ -36,6 +36,7 @@ Lockit combines a Tauri desktop application, a React client, an embedded Node.js
 | Breach checks | HaveIBeenPwned range API using a five-character SHA-1 prefix computed locally |
 | Session protection | Eight-hour server sessions, five-minute idle lock, explicit lock and logout |
 | Password changes | Private-key re-wrapping without changing vault data; other server sessions revoked |
+| Recovery | Downloadable 256-bit recovery key with local unlock and explicit rotation |
 | Native CLI | Locked sensitive buffers, hidden password input, deterministic cleanup |
 | Abuse controls | Registration and login throttles, item quotas, bounded HIBP concurrency |
 | Deployment | Local desktop, local browser, or optional Docker deployment behind Caddy and TLS 1.3 |
@@ -62,6 +63,10 @@ Download the appropriate package from [GitHub Releases](https://github.com/iszzy
 - **Other Linux distributions:** make the AppImage executable and run it. On systems without FUSE, use `--appimage-extract-and-run`.
 
 The app stores its encrypted database and randomly generated share pepper in the operating system's per-user Lockit data directory. Uninstalling the application does not imply secure deletion of that data; remove the data directory explicitly if required.
+
+### Recovery file
+
+During account creation, download the `lockit-recovery-key.txt` file and store it separately from the device. Use it from the unlock screen if you forget the master password. The key is generated locally and is not uploaded. Anyone who obtains the file can unlock the vault, so rotate it from **Settings → Recovery key** if it may have been exposed. Losing both the master password and recovery file makes the vault unrecoverable.
 
 ### Build the desktop application
 
@@ -190,10 +195,14 @@ flowchart TD
 
     KEK -->|XSalsa20-Poly1305| EID[Encrypted Ed25519 private key]
     KEK -->|XSalsa20-Poly1305| EV[Encrypted X25519 private key]
+    RK[Random 256-bit recovery key<br/>downloaded file only] --> REID[Recovery Ed25519 box]
+    RK --> REV[Recovery X25519 box]
 
     EID --> ID[Ed25519 identity private key]
+    REID --> ID
     ID --> Sign[Sign single-use login challenges]
     EV --> X[X25519 vault private key]
+    REV --> X
     X --> Open[Open sealed vault data key]
     Sealed[Sealed random 32-byte data key] --> Open
 
@@ -236,7 +245,7 @@ Changing the account, item, share, nonce, or ciphertext causes authenticated dec
 ### Authentication without a password verifier
 
 1. The client requests a challenge and encrypted key bundle using its email.
-2. Argon2id derives the key-encryption key locally.
+2. Either Argon2id derives the master key locally, or the user-held recovery key opens its separate encrypted copies.
 3. The client unwraps the Ed25519 private key.
 4. The client signs the random 32-byte challenge.
 5. The server verifies the signature with the stored public key.
@@ -245,7 +254,37 @@ Changing the account, item, share, nonce, or ciphertext causes authenticated dec
 
 Challenges expire after five minutes. Sessions expire after eight hours. Logout revokes the current session; a master-password change revokes other sessions.
 
+Registration downloads a random 256-bit recovery key. Anyone with that file can unlock the encrypted bundle, so it is a second full-strength credential and must be stored offline. Replace it from Settings if it may be exposed. Master-password changes preserve the recovery path; recovery rotation changes only the recovery-wrapped private-key boxes.
+
 **Important:** the pre-authentication key bundle permits offline password guessing. Argon2id raises its cost but cannot compensate for a weak master password.
+
+### Recovery key lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant C as Client
+    participant F as Recovery file
+    participant A as Node API
+    participant D as SQLite
+
+    U->>C: Create master password
+    C->>C: Generate identity, vault, and recovery keys
+    C->>C: Wrap private keys under master and recovery keys
+    C->>A: Register encrypted key bundle
+    A->>D: Store ciphertext and public keys
+    C->>F: Download random 256-bit key
+    C->>C: Wipe recovery bytes
+
+    U->>C: Unlock with recovery file
+    C->>A: Request challenge and bundle
+    A-->>C: Random challenge and encrypted boxes
+    F->>C: Supply recovery key locally
+    C->>C: Decrypt identity private key
+    C->>A: Sign challenge
+    A-->>C: Create session
+```
 
 ## Core workflows
 
@@ -567,8 +606,9 @@ Verification coverage includes:
 
 | Failure | Behavior | Recovery |
 |---|---|---|
-| Wrong master password | Private-key authentication fails locally | Retry with the correct password; no server reset exists |
-| Forgotten master password | Vault cannot be decrypted | Restore from a separately secured password backup if available; otherwise data is unrecoverable |
+| Wrong master password | Private-key authentication fails locally | Retry with the correct password or use the recovery file |
+| Forgotten master password | Vault cannot be unlocked by the server | Use the recovery file; if both credentials are lost, data is unrecoverable |
+| Recovery file exposed | Anyone holding it can unlock the encrypted bundle | Rotate it from Settings, then destroy copies of the old file |
 | Tampered ciphertext | Poly1305/AAD verification fails | Do not display the item; restore a known-good backup |
 | Server returns stale or missing data | Client cannot prove freshness | Restore or compare backups; no signed history exists |
 | Sidecar fails or health times out | Desktop startup fails with diagnostics | Check packaged resources, local permissions, and app-data access |
@@ -586,7 +626,7 @@ Verification coverage includes:
 - **No password-equivalent verifier:** signed key possession replaces reusable password proof.
 - **No mandatory cloud account:** the desktop application works locally by default.
 - **No custom cryptographic primitives:** libsodium supplies reviewed constructions.
-- **No hidden recovery key:** recovery would create a second decryption path outside the stated trust model.
+- **No server-held recovery key:** recovery remains user-held and encrypted on the client.
 
 ## Security boundaries
 
@@ -598,9 +638,10 @@ Key residual risks:
 - Malicious client delivery or a compromised desktop/WebView.
 - Email, item-count, size, timing, and HIBP-prefix metadata exposure.
 - Server deletion or rollback of ciphertext.
+- Recovery-file theft or accidental disclosure.
 - Browser/JavaScript memory copies and OS crash artifacts.
 - Clipboard, downloads, terminal output, screenshots, and recipient-retained plaintext.
 - Account-existence disclosure and targeted throttling denial of service.
 - Unsigned installers until release-signing certificates are configured.
 
-There is deliberately no master-password reset or hidden recovery route. This project has not undergone a real independent cryptographic audit.
+There is deliberately no master-password reset or server-held recovery route. Losing both the master password and recovery file makes the vault unrecoverable. This project has not undergone a real independent cryptographic audit.

@@ -11,11 +11,14 @@ import {
   encryptShare,
   fromBase64Url,
   parseHibpResponse,
+  parseRecoveryKey,
   rewrap,
+  rotateRecoveryKey,
   signChallenge,
   toBase64Url,
   unlock,
   wipeKeys,
+  wipeRecoveryKey,
 } from '../src/shared/crypto';
 
 const password = 'a long correct horse battery staple';
@@ -37,21 +40,72 @@ test('base64url helpers roundtrip arbitrary bytes', async () => {
   assert.deepEqual(fromBase64Url(encoded), bytes);
 });
 
-test('registration, challenge signing, unlock, and wrong-password rejection', async () => {
+test('registration supports master and recovery unlock and rejects wrong credentials', async () => {
   const registration = await createRegistration(password);
   try {
+    assert.equal(registration.recoveryKey.length, 32);
+    assert.equal(registration.recoveryKeyEncoded, toBase64Url(registration.recoveryKey));
     const challenge = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
     const signature = await signChallenge(challenge, registration.keys.identitySecretKey);
     assert.ok(fromBase64Url(signature).length > 0);
-    await assert.rejects(unlock('definitely not the master password', registration.bundle));
-    const unlocked = await unlock(password, registration.bundle);
+    await assert.rejects(unlock('definitely not the master password', registration.bundle, 'master'));
+    await assert.rejects(unlock(new Uint8Array(32), registration.bundle, 'recovery'));
+    await assert.rejects(unlock(new Uint8Array(31), registration.bundle, 'recovery'));
+
+    const masterKeys = await unlock(password, registration.bundle, 'master');
+    const recoveryKeys = await unlock(registration.recoveryKey, registration.bundle, 'recovery');
     try {
-      assert.deepEqual(unlocked.vaultKey, registration.keys.vaultKey);
+      assert.deepEqual(masterKeys.vaultKey, registration.keys.vaultKey);
+      assert.deepEqual(recoveryKeys.vaultKey, registration.keys.vaultKey);
+      assert.deepEqual(recoveryKeys.identitySecretKey, registration.keys.identitySecretKey);
     } finally {
-      wipeKeys(unlocked);
+      wipeKeys(masterKeys);
+      wipeKeys(recoveryKeys);
     }
   } finally {
     wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
+  }
+});
+
+test('recovery parser accepts files and raw keys and rejects malformed encodings', async () => {
+  const registration = await createRegistration(password);
+  try {
+    const encoded = registration.recoveryKeyEncoded;
+    const fromFile = await parseRecoveryKey(`Lockit recovery key\n\nAccount: person@example.test\nRecovery key: ${encoded}\n\nKeep safe.\n`);
+    const fromRaw = await parseRecoveryKey(`  ${encoded}\n`);
+    try {
+      assert.deepEqual(fromFile, registration.recoveryKey);
+      assert.deepEqual(fromRaw, registration.recoveryKey);
+    } finally {
+      wipeRecoveryKey(fromFile);
+      wipeRecoveryKey(fromRaw);
+    }
+    await assert.rejects(parseRecoveryKey(`${encoded}=`));
+    await assert.rejects(parseRecoveryKey(toBase64Url(new Uint8Array(31))));
+    await assert.rejects(parseRecoveryKey('not a recovery key'));
+    await assert.rejects(parseRecoveryKey(`Recovery key: ${encoded}\nRecovery key: ${encoded}`));
+  } finally {
+    wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
+  }
+});
+
+test('recovery boxes reject tampering without affecting master boxes', async () => {
+  const registration = await createRegistration(password);
+  try {
+    const ciphertext = fromBase64Url(registration.bundle.encryptedRecoveryVaultSecret.ciphertext);
+    ciphertext[0] = (ciphertext[0] ?? 0) ^ 1;
+    const tampered = {
+      ...registration.bundle,
+      encryptedRecoveryVaultSecret: { ...registration.bundle.encryptedRecoveryVaultSecret, ciphertext: toBase64Url(ciphertext) },
+    };
+    await assert.rejects(unlock(registration.recoveryKey, tampered, 'recovery'));
+    const masterKeys = await unlock(password, tampered, 'master');
+    wipeKeys(masterKeys);
+  } finally {
+    wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
   }
 });
 
@@ -69,10 +123,11 @@ test('item encryption roundtrips and rejects tampering and wrong AAD', async () 
     await assert.rejects(decryptItem({ ...envelope, id: crypto.randomUUID() }, registration.bundle.identityPublicKey, registration.keys.vaultKey));
   } finally {
     wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
   }
 });
 
-test('rewrap retains public identity and sealed data key but rejects the old password', async () => {
+test('rewrap preserves recovery boxes and all stable account keys', async () => {
   const registration = await createRegistration(password);
   try {
     const encrypted = await encryptItem(item, registration.bundle.identityPublicKey, registration.keys.vaultKey);
@@ -80,17 +135,50 @@ test('rewrap retains public identity and sealed data key but rejects the old pas
     assert.equal(changed.identityPublicKey, registration.bundle.identityPublicKey);
     assert.equal(changed.vaultPublicKey, registration.bundle.vaultPublicKey);
     assert.equal(changed.sealedVaultKey, registration.bundle.sealedVaultKey);
+    assert.deepEqual(changed.encryptedRecoveryIdentitySecret, registration.bundle.encryptedRecoveryIdentitySecret);
+    assert.deepEqual(changed.encryptedRecoveryVaultSecret, registration.bundle.encryptedRecoveryVaultSecret);
     assert.notEqual(changed.salt, registration.bundle.salt);
-    await assert.rejects(unlock(password, changed));
-    const unlocked = await unlock('a wholly new master password', changed);
+    await assert.rejects(unlock(password, changed, 'master'));
+    const unlocked = await unlock('a wholly new master password', changed, 'master');
+    const recovered = await unlock(registration.recoveryKey, changed, 'recovery');
     try {
       assert.deepEqual(unlocked.vaultKey, registration.keys.vaultKey);
+      assert.deepEqual(recovered.vaultKey, registration.keys.vaultKey);
       assert.deepEqual(await decryptItem({ id: item.id, version: 1, updatedAt: item.updatedAt, ...encrypted }, changed.identityPublicKey, unlocked.vaultKey), item);
     } finally {
       wipeKeys(unlocked);
+      wipeKeys(recovered);
     }
   } finally {
     wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
+  }
+});
+
+test('recovery rotation invalidates the old key and preserves master credentials', async () => {
+  const registration = await createRegistration(password);
+  const rotation = await rotateRecoveryKey(registration.keys, registration.bundle);
+  try {
+    assert.equal(rotation.bundle.identityPublicKey, registration.bundle.identityPublicKey);
+    assert.equal(rotation.bundle.vaultPublicKey, registration.bundle.vaultPublicKey);
+    assert.equal(rotation.bundle.sealedVaultKey, registration.bundle.sealedVaultKey);
+    assert.deepEqual(rotation.bundle.encryptedIdentitySecret, registration.bundle.encryptedIdentitySecret);
+    assert.deepEqual(rotation.bundle.encryptedVaultSecret, registration.bundle.encryptedVaultSecret);
+    assert.notEqual(rotation.recoveryKeyEncoded, registration.recoveryKeyEncoded);
+    await assert.rejects(unlock(registration.recoveryKey, rotation.bundle, 'recovery'));
+    const recovered = await unlock(rotation.recoveryKey, rotation.bundle, 'recovery');
+    const masterKeys = await unlock(password, rotation.bundle, 'master');
+    try {
+      assert.deepEqual(recovered.vaultKey, registration.keys.vaultKey);
+      assert.deepEqual(masterKeys.vaultKey, registration.keys.vaultKey);
+    } finally {
+      wipeKeys(recovered);
+      wipeKeys(masterKeys);
+    }
+  } finally {
+    wipeKeys(registration.keys);
+    wipeRecoveryKey(registration.recoveryKey);
+    wipeRecoveryKey(rotation.recoveryKey);
   }
 });
 

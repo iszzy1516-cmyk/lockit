@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   CheckCircle,
+  ClipboardText,
   Clock,
   Copy,
   DownloadSimple,
   Eye,
   EyeSlash,
   FileText,
-  HardDrive,
-  Info,
+  Gear,
   Key,
   Link,
   Lock,
@@ -32,15 +32,31 @@ import {
   decryptShare,
   encryptItem,
   encryptShare,
+  parseRecoveryKey,
   rewrap,
+  rotateRecoveryKey,
   signChallenge,
   unlock,
   wipeKeys,
+  wipeRecoveryKey,
   type HibpResult,
+  type RecoveryMaterial,
+  type RegistrationKeys,
   type UnlockedKeys,
 } from '../shared/crypto';
 import { ENVELOPE_VERSION, type EncryptedItem, type KeyBundle, type Share, type VaultItem, type VaultItemKind } from '../shared/api';
 import * as api from './api';
+import {
+  getAppearance,
+  getClipboardClearSeconds,
+  getIdleLockMinutes,
+  setAppearance,
+  setClipboardClearSeconds,
+  setIdleLockMinutes,
+  type Appearance,
+  type ClipboardClearSeconds,
+  type IdleLockMinutes,
+} from './preferences';
 
 const MAX_DOCUMENT_BASE64 = 2 * 1024 * 1024;
 
@@ -72,8 +88,28 @@ function Field({ label, hint, children }: { label: string; hint?: string | undef
   return <label className="field"><span className="field__label">{label}</span>{children}{hint && <span className="field__hint">{hint}</span>}</label>;
 }
 
+let clipboardClearTimer: number | undefined;
+
+function scheduleClipboardClear(): void {
+  if (clipboardClearTimer !== undefined) window.clearTimeout(clipboardClearTimer);
+  const clear = async () => {
+    if (!document.hasFocus()) {
+      clipboardClearTimer = window.setTimeout(() => void clear(), 1000);
+      return;
+    }
+    clipboardClearTimer = undefined;
+    try {
+      await navigator.clipboard.writeText('');
+    } catch {
+      return;
+    }
+  };
+  clipboardClearTimer = window.setTimeout(() => void clear(), getClipboardClearSeconds() * 1000);
+}
+
 async function copyText(value: string): Promise<void> {
   await navigator.clipboard.writeText(value);
+  scheduleClipboardClear();
 }
 
 function safeHttpUrl(value: string): string | undefined {
@@ -98,6 +134,46 @@ function downloadDocument(item: VaultItem): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function downloadRecoveryFile(email: string, recovery: RecoveryMaterial): void {
+  const contents = [
+    'Lockit recovery key',
+    '',
+    `Account: ${email}`,
+    `Created: ${new Date().toISOString()}`,
+    '',
+    `Recovery key: ${recovery.recoveryKeyEncoded}`,
+    '',
+    'Anyone with this file can unlock your vault and decrypt your data.',
+    'Store it offline in a safe place, separate from your master password.',
+    'Lockit cannot send this recovery key again. Keep the file safe.',
+    '',
+  ].join('\n');
+  const url = URL.createObjectURL(new Blob([contents], { type: 'text/plain;charset=utf-8' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = 'lockit-recovery-key.txt';
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function downloadEncryptedBackup(email: string, bundle: KeyBundle): Promise<void> {
+  const [itemResponse, shareResponse] = await Promise.all([api.listItems(), api.listShares()]);
+  const backup = {
+    formatVersion: 1,
+    account: { email },
+    bundle,
+    exportedAt: new Date().toISOString(),
+    encryptedItems: itemResponse.items,
+    encryptedShares: shareResponse.shares,
+  };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json;charset=utf-8' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `lockit-encrypted-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function AuthScreen({
   initialMode,
   initialEmail,
@@ -113,12 +189,74 @@ function AuthScreen({
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
+  const [unlockMethod, setUnlockMethod] = useState<'master' | 'recovery'>('master');
+  const [recoveryFileName, setRecoveryFileName] = useState('');
+  const [pendingRecovery, setPendingRecovery] = useState<RegistrationKeys | null>(null);
+  const [downloaded, setDownloaded] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const recoveryCredential = useRef<Uint8Array | null>(null);
+  const pendingRecoveryRef = useRef<RegistrationKeys | null>(null);
+  pendingRecoveryRef.current = pendingRecovery;
 
   useEffect(() => {
     if (initialEmail) setEmail(initialEmail);
   }, [initialEmail]);
+
+  useEffect(() => () => {
+    wipeRecoveryKey(recoveryCredential.current);
+    const pending = pendingRecoveryRef.current;
+    if (pending) {
+      wipeRecoveryKey(pending.recoveryKey);
+      wipeKeys(pending.keys);
+    }
+  }, []);
+
+  const clearRecoveryCredential = () => {
+    wipeRecoveryKey(recoveryCredential.current);
+    recoveryCredential.current = null;
+    setRecoveryFileName('');
+  };
+
+  const chooseUnlockMethod = (method: 'master' | 'recovery') => {
+    clearRecoveryCredential();
+    setUnlockMethod(method);
+    setError('');
+  };
+
+  const readRecoveryFile = async (file: File | undefined) => {
+    clearRecoveryCredential();
+    setError('');
+    if (!file) return;
+    try {
+      const key = await parseRecoveryKey(await file.text());
+      recoveryCredential.current = key;
+      setRecoveryFileName(file.name);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'The recovery file could not be read.');
+    }
+  };
+
+  const continueRegistration = async () => {
+    const pending = pendingRecovery;
+    if (!pending || !downloaded || !acknowledged) return;
+    setBusy(true);
+    setError('');
+    try {
+      setPendingRecovery(null);
+      pendingRecoveryRef.current = null;
+      wipeRecoveryKey(pending.recoveryKey);
+      await onRegistered(email, pending.bundle, pending.keys);
+      setPassword('');
+      setConfirmation('');
+    } catch (cause) {
+      wipeKeys(pending.keys);
+      setError(cause instanceof Error ? cause.message : 'The vault could not be opened.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -131,20 +269,34 @@ function AuthScreen({
       setError('Use at least 12 characters for your master password.');
       return;
     }
+    if (mode === 'unlock' && unlockMethod === 'recovery' && !recoveryCredential.current) {
+      setError('Choose a valid Lockit recovery key file.');
+      return;
+    }
     setBusy(true);
     try {
       if (mode === 'register') {
         const registration = await createRegistration(password);
         try {
           await api.register({ email, ...registration.bundle });
-          await onRegistered(email, registration.bundle, registration.keys);
+          setPendingRecovery(registration);
+          setDownloaded(false);
+          setAcknowledged(false);
         } catch (error) {
           wipeKeys(registration.keys);
+          wipeRecoveryKey(registration.recoveryKey);
           throw error;
         }
       } else {
         const response = await api.challenge(email);
-        const keys = await unlock(password, response.bundle);
+        const credential = unlockMethod === 'recovery' ? recoveryCredential.current : null;
+        recoveryCredential.current = null;
+        let keys: UnlockedKeys;
+        try {
+          keys = await unlock(unlockMethod === 'recovery' ? credential! : password, response.bundle, unlockMethod);
+        } finally {
+          wipeRecoveryKey(credential);
+        }
         try {
           const signature = await signChallenge(response.challenge, keys.identitySecretKey);
           await api.verify(response.challengeId, signature);
@@ -166,7 +318,16 @@ function AuthScreen({
   return (
     <main className="auth-shell">
       <header className="auth-header"><Wordmark /><span className="local-badge"><ShieldCheck size={15} aria-hidden="true" />Local encryption</span></header>
-      <section className="auth-panel" aria-labelledby="auth-title">
+      {pendingRecovery ? <section className="auth-panel recovery-setup" aria-labelledby="recovery-title">
+        <div className="auth-panel__heading"><h1 id="recovery-title">Save your recovery key</h1><p>Your account is ready. Download the recovery file before entering your vault.</p></div>
+        <div className="recovery-step"><span>1</span><div><strong>Download the file</strong><p>Keep it offline and separate from your master password.</p></div></div>
+        <Button variant="secondary" onClick={() => { downloadRecoveryFile(email, pendingRecovery); setDownloaded(true); }}><DownloadSimple size={16} aria-hidden="true" />{downloaded ? 'Download recovery file again' : 'Download recovery file'}</Button>
+        {downloaded && <p className="download-confirmation" role="status"><CheckCircle size={15} aria-hidden="true" />Recovery file downloaded.</p>}
+        <div className="warning"><Warning size={18} aria-hidden="true" /><div><strong>Anyone with this file can unlock your vault</strong><span>Lockit cannot send this recovery key again. Losing both the file and master password means losing access.</span></div></div>
+        <label className="acknowledgment"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /><span>I saved my recovery file in a safe place</span></label>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <Button disabled={!downloaded || !acknowledged || busy} onClick={() => void continueRegistration()}>{busy ? 'Opening your vault…' : 'Continue'}</Button>
+      </section> : <section className="auth-panel" aria-labelledby="auth-title">
         <div className="auth-panel__heading">
           <h1 id="auth-title">{mode === 'register' ? 'Create your vault' : 'Welcome back'}</h1>
           <p>{mode === 'register' ? 'Set up encrypted storage for your credentials and files.' : 'Unlock your encrypted vault on this device.'}</p>
@@ -175,25 +336,26 @@ function AuthScreen({
           <button role="tab" aria-selected={mode === 'unlock'} onClick={() => { setMode('unlock'); setError(''); }}>Unlock vault</button>
           <button role="tab" aria-selected={mode === 'register'} onClick={() => { setMode('register'); setError(''); }}>Create vault</button>
         </div>
+        {mode === 'unlock' && <div className="unlock-method" role="group" aria-label="Unlock method"><button type="button" aria-pressed={unlockMethod === 'master'} onClick={() => chooseUnlockMethod('master')}>Master password</button><button type="button" aria-pressed={unlockMethod === 'recovery'} onClick={() => chooseUnlockMethod('recovery')}>Use recovery file</button></div>}
         <form onSubmit={submit} className="auth-form">
           <Field label="Email address">
             <input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
           </Field>
-          <Field label="Master password" hint={mode === 'register' ? 'Use at least 12 characters. A long phrase works well.' : undefined}>
+          {(mode === 'register' || unlockMethod === 'master') && <Field label="Master password" hint={mode === 'register' ? 'Use at least 12 characters. A long phrase works well.' : undefined}>
             <input type="password" autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required minLength={mode === 'register' ? 12 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} />
-          </Field>
+          </Field>}
           {mode === 'register' && <>
             <Field label="Confirm master password">
               <input type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
             </Field>
-            <div className="warning"><Warning size={18} aria-hidden="true" /><div><strong>No password recovery</strong><span>Lockit cannot recover your master password or decrypt your data. Store it somewhere safe.</span></div></div>
+            <div className="warning"><Warning size={18} aria-hidden="true" /><div><strong>Keep your recovery file safe</strong><span>It can unlock this vault if you forget your master password. Lockit cannot replace a lost file.</span></div></div>
           </>}
+          {mode === 'unlock' && unlockMethod === 'recovery' && <div className="recovery-upload"><Field label="Recovery key file" hint={recoveryFileName || 'Choose lockit-recovery-key.txt'}><input type="file" accept=".txt,text/plain" onChange={(event) => void readRecoveryFile(event.target.files?.[0])} /></Field><p>The file is parsed locally and never uploaded.</p></div>}
           {error && <p className="form-error" role="alert">{error}</p>}
           <Button type="submit" disabled={busy}>{busy ? (mode === 'register' ? 'Building your keys…' : 'Unlocking locally…') : (mode === 'register' ? 'Create encrypted vault' : 'Unlock vault')}</Button>
-          {mode === 'register' && <p className="fine-print">Argon2id setup uses 64 MiB of memory and may take a moment. This makes password guessing harder.</p>}
         </form>
         <p className="auth-panel__foot"><LockSimple size={14} aria-hidden="true" />Your master password never leaves this device.</p>
-      </section>
+      </section>}
       <footer className="auth-footer">Zero knowledge vault <span>Local key custody</span></footer>
     </main>
   );
@@ -352,11 +514,29 @@ function SharesView({ shares, items, onRevoke }: { shares: Share[]; items: Vault
   return <section className="workspace-section"><div className="page-heading"><div><h1>Shares</h1><p>Time limited snapshots of your encrypted items.</p></div><span className="count-badge">{shares.length}</span></div>{shares.length === 0 ? <div className="empty"><Link size={28} aria-hidden="true" /><h2>No shared items</h2><p>Open a vault item to create a time limited encrypted snapshot.</p></div> : <div className="shares-table"><div className="shares-table__head"><span>Item</span><span>Status</span><span>Expires</span><span>Action</span></div>{shares.map((share) => { const item = items.find((candidate) => candidate.id === share.itemId); const expired = new Date(share.expiresAt).getTime() <= Date.now(); const status = share.revokedAt ? 'Revoked' : expired ? 'Expired' : 'Active'; return <div className="shares-table__row" key={share.id}><span><strong>{item?.title ?? 'Deleted item'}</strong><small>Created {new Date(share.createdAt).toLocaleDateString()}</small></span><span className={`status status--${status.toLowerCase()}`}>{status}</span><span>{new Date(share.expiresAt).toLocaleString()}</span><span>{!share.revokedAt && !expired && <button className="text-button text-button--danger" onClick={() => void onRevoke(share.id)}>Revoke</button>}</span></div>; })}</div>}</section>;
 }
 
-function SecurityView({ onChangePassword, busy }: { onChangePassword: (current: string, next: string) => Promise<void>; busy: boolean }) {
+function SettingsView({
+  onChangePassword,
+  onRotateRecovery,
+  onLock,
+  onExportBackup,
+  idleLockMinutes,
+  onIdleLockChange,
+  busy,
+}: {
+  onChangePassword: (current: string, next: string) => Promise<void>;
+  onRotateRecovery: () => Promise<void>;
+  onLock: () => void;
+  onExportBackup: () => Promise<void>;
+  idleLockMinutes: IdleLockMinutes;
+  onIdleLockChange: (minutes: IdleLockMinutes) => void;
+  busy: boolean;
+}) {
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [confirmation, setConfirmation] = useState('');
   const [error, setError] = useState('');
+  const [appearance, setAppearanceChoice] = useState<Appearance>(getAppearance);
+  const [clipboardSeconds, setClipboardSeconds] = useState<ClipboardClearSeconds>(getClipboardClearSeconds);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError('');
@@ -367,16 +547,68 @@ function SecurityView({ onChangePassword, busy }: { onChangePassword: (current: 
       setCurrent(''); setNext(''); setConfirmation('');
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'The password could not be changed.'); }
   };
-  return <section className="workspace-section security-page"><div className="page-heading"><div><h1>Security</h1><p>Manage your master password and review local protection.</p></div></div><div className="security-layout"><form className="password-change settings-panel" onSubmit={submit}><div className="panel-heading"><div><h2>Change master password</h2><p>Re-encrypt your private keys without changing your vault contents.</p></div><LockSimple size={19} aria-hidden="true" /></div><Field label="Current master password"><input type="password" autoComplete="current-password" required value={current} onChange={(event) => setCurrent(event.target.value)} /></Field><Field label="New master password"><input type="password" autoComplete="new-password" minLength={12} required value={next} onChange={(event) => setNext(event.target.value)} /></Field><Field label="Confirm new master password"><input type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></Field><div className="warning"><Warning size={18} aria-hidden="true" /><div><strong>No recovery route</strong><span>Store the new password safely. Lockit cannot recover it for you.</span></div></div>{error && <p className="form-error" role="alert">{error}</p>}<div className="form-actions"><Button disabled={busy} type="submit">{busy ? 'Rewrapping keys…' : 'Change master password'}</Button></div></form><aside className="security-summary" aria-label="Local protection summary"><section className="settings-panel protection-panel"><div className="panel-heading"><div><h2>Local protection</h2><p>Current session and key custody.</p></div><ShieldCheck size={20} aria-hidden="true" /></div><div className="protection-status"><span className="status-dot" /><div><strong>Vault unlocked</strong><span>Keys are available in this tab only.</span></div></div><dl className="summary-list"><div><dt><HardDrive size={15} aria-hidden="true" />Browser storage</dt><dd>No plaintext or keys</dd></div><div><dt><Clock size={15} aria-hidden="true" />Idle lock</dt><dd>After 5 minutes</dd></div><div><dt><LockSimple size={15} aria-hidden="true" />Key custody</dt><dd>This device</dd></div></dl></section><details className="settings-panel algorithm-details"><summary><span><Info size={16} aria-hidden="true" />Encryption details</span><span className="details-action">View algorithms</span></summary><dl className="algorithm-list"><div><dt>Password derivation</dt><dd>Argon2id, 3 operations, 64 MiB</dd></div><div><dt>Item encryption</dt><dd>XChaCha20-Poly1305</dd></div><div><dt>Login challenges</dt><dd>Ed25519 signatures</dd></div><div><dt>Vault key exchange</dt><dd>X25519 sealed boxes</dd></div></dl></details><p className="security-note">Your master password and unlocked keys are never written to localStorage or sessionStorage.</p></aside></div></section>;
+  const chooseAppearance = (choice: Appearance) => {
+    setAppearance(choice);
+    setAppearanceChoice(choice);
+  };
+  const chooseClipboardDelay = (seconds: ClipboardClearSeconds) => {
+    setClipboardClearSeconds(seconds);
+    setClipboardSeconds(seconds);
+  };
+  return (
+    <section className="workspace-section settings-page">
+      <div className="page-heading"><div><h1>Settings</h1><p>Manage account security and local preferences.</p></div></div>
+      <div className="settings-columns">
+        <div className="settings-primary">
+          <form className="password-change settings-panel" onSubmit={submit}>
+            <div className="panel-heading"><div><h2>Master password</h2><p>Re-encrypt your private keys without changing your vault contents.</p></div><LockSimple size={19} aria-hidden="true" /></div>
+            <Field label="Current master password"><input type="password" autoComplete="current-password" required value={current} onChange={(event) => setCurrent(event.target.value)} /></Field>
+            <Field label="New master password"><input type="password" autoComplete="new-password" minLength={12} required value={next} onChange={(event) => setNext(event.target.value)} /></Field>
+            <Field label="Confirm new master password"><input type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></Field>
+            <div className="warning"><Warning size={18} aria-hidden="true" /><div><strong>Protect your recovery file</strong><span>Changing your master password does not change the recovery file. Anyone holding it can still unlock this vault.</span></div></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="form-actions"><Button disabled={busy} type="submit">{busy ? 'Rewrapping keys…' : 'Change master password'}</Button></div>
+          </form>
+          <section className="settings-panel recovery-management">
+            <div className="panel-heading"><div><h2>Recovery key</h2><p>Replace the file that can unlock this vault.</p></div><Key size={19} aria-hidden="true" /></div>
+            <p>Rotation downloads a new recovery file and disables every previous file. Your master password stays unchanged.</p>
+            <Button variant="secondary" disabled={busy} onClick={() => void onRotateRecovery()}><DownloadSimple size={15} aria-hidden="true" />{busy ? 'Updating settings…' : 'Replace recovery key'}</Button>
+          </section>
+        </div>
+        <div className="settings-secondary">
+          <section className="settings-panel preference-panel">
+            <div className="panel-heading"><div><h2>Session</h2><p>Lock this vault manually or after inactivity.</p></div><Clock size={18} aria-hidden="true" /></div>
+            <Field label="Idle lock timeout"><select value={idleLockMinutes} onChange={(event) => onIdleLockChange(Number(event.target.value) as IdleLockMinutes)}><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option></select></Field>
+            <Button variant="secondary" onClick={onLock}><LockSimple size={15} aria-hidden="true" />Lock now</Button>
+          </section>
+          <section className="settings-panel preference-panel">
+            <div className="panel-heading"><div><h2>Appearance</h2><p>Choose how Lockit looks on this device.</p></div></div>
+            <div className="choice-group" role="group" aria-label="Appearance">{(['system', 'light', 'dark'] as const).map((choice) => <button key={choice} aria-pressed={appearance === choice} onClick={() => chooseAppearance(choice)}>{choice === 'system' ? 'System' : choice === 'light' ? 'Light' : 'Dark'}</button>)}</div>
+          </section>
+          <section className="settings-panel preference-panel">
+            <div className="panel-heading"><div><h2>Clipboard</h2><p>Clear copied secrets after a delay.</p></div><ClipboardText size={18} aria-hidden="true" /></div>
+            <Field label="Clear clipboard after"><select value={clipboardSeconds} onChange={(event) => chooseClipboardDelay(Number(event.target.value) as ClipboardClearSeconds)}><option value={10}>10 seconds</option><option value={30}>30 seconds</option><option value={60}>60 seconds</option></select></Field>
+          </section>
+          <section className="settings-panel preference-panel">
+            <div className="panel-heading"><div><h2>Data</h2><p>Download your encrypted server data.</p></div><DownloadSimple size={18} aria-hidden="true" /></div>
+            <p>The JSON backup stays encrypted and contains no plaintext items or recovery keys.</p>
+            <Button variant="secondary" disabled={busy} onClick={() => void onExportBackup()}><DownloadSimple size={15} aria-hidden="true" />Export encrypted backup</Button>
+          </section>
+        </div>
+      </div>
+    </section>
+  );
 }
 
-function Vault({ session, setSession, onLock, onLogout }: {
+function Vault({ session, setSession, onLock, onLogout, idleLockMinutes, onIdleLockChange }: {
   session: Session;
   setSession: (updater: (session: Session) => Session) => void;
   onLock: () => void;
   onLogout: () => Promise<void>;
+  idleLockMinutes: IdleLockMinutes;
+  onIdleLockChange: (minutes: IdleLockMinutes) => void;
 }) {
-  const [tab, setTab] = useState<'vault' | 'shares' | 'security'>('vault');
+  const [tab, setTab] = useState<'vault' | 'shares' | 'settings'>('vault');
   const [filter, setFilter] = useState<'all' | VaultItemKind>('all');
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -432,6 +664,35 @@ function Vault({ session, setSession, onLock, onLogout }: {
       setNotice({ tone: 'success', text: 'Master password changed. Your private keys were re-encrypted.' });
     } finally { setBusy(false); }
   };
+  const replaceRecovery = async () => {
+    setBusy(true);
+    try {
+      const recovery = await rotateRecoveryKey(session.keys, session.bundle);
+      try {
+        await api.updateBundle(recovery.bundle);
+        setSession((value) => ({ ...value, bundle: recovery.bundle }));
+        downloadRecoveryFile(session.email, recovery);
+        setNotice({ tone: 'success', text: 'Recovery key replaced. The new file was downloaded and previous files no longer work.' });
+      } finally {
+        wipeRecoveryKey(recovery.recoveryKey);
+      }
+    } catch (cause) {
+      setNotice({ tone: 'error', text: cause instanceof Error ? cause.message : 'The recovery key could not be replaced.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const exportBackup = async () => {
+    setBusy(true);
+    try {
+      await downloadEncryptedBackup(session.email, session.bundle);
+      setNotice({ tone: 'success', text: 'Encrypted backup downloaded.' });
+    } catch (cause) {
+      setNotice({ tone: 'error', text: cause instanceof Error ? cause.message : 'The encrypted backup could not be exported.' });
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="vault-shell">
@@ -440,17 +701,13 @@ function Vault({ session, setSession, onLock, onLogout }: {
         <nav className="sidebar-nav" aria-label="Main navigation">
           <button aria-current={tab === 'vault' ? 'page' : undefined} onClick={() => setTab('vault')} title="Vault"><VaultIcon size={19} aria-hidden="true" /><span>Vault</span></button>
           <button aria-current={tab === 'shares' ? 'page' : undefined} onClick={() => setTab('shares')} title="Shares"><ShareNetwork size={19} aria-hidden="true" /><span>Shares</span></button>
-          <button aria-current={tab === 'security' ? 'page' : undefined} onClick={() => setTab('security')} title="Security"><ShieldCheck size={19} aria-hidden="true" /><span>Security</span></button>
+          <button aria-current={tab === 'settings' ? 'page' : undefined} onClick={() => setTab('settings')} title="Settings"><Gear size={19} aria-hidden="true" /><span>Settings</span></button>
         </nav>
-        <div className="sidebar-footer">
-          <div className="local-status"><span className="status-dot" /><div><strong>Unlocked locally</strong><span>{session.items.length} {session.items.length === 1 ? 'item' : 'items'} in memory</span></div></div>
-          <p>Automatic lock after 5 minutes of inactivity.</p>
-        </div>
       </aside>
       <div className="app-frame">
         <header className="vault-header">
-          <div className="utility-context"><span>Personal vault</span><span className="utility-separator">/</span><strong>{tab === 'vault' ? 'Items' : tab === 'shares' ? 'Shared links' : 'Security settings'}</strong></div>
-          <div className="account-menu"><span className="account-email" title={session.email}>{session.email}</span><button onClick={onLock}><LockSimple size={15} aria-hidden="true" />Lock</button><button onClick={() => void onLogout()}><SignOut size={15} aria-hidden="true" />Log out</button></div>
+          <div className="utility-context"><span>Personal vault</span><span className="utility-separator">/</span><strong>{tab === 'vault' ? 'Items' : tab === 'shares' ? 'Shared links' : 'Settings'}</strong></div>
+          <div className="account-menu"><span className="account-email" title={session.email}>{session.email}</span><button onClick={() => void onLogout()}><SignOut size={15} aria-hidden="true" />Log out</button></div>
         </header>
         <main className="vault-main">
           {notice && <div className={`notice notice--${notice.tone}`} role="status"><CheckCircle size={17} aria-hidden="true" /><span>{notice.text}</span><button onClick={() => setNotice(null)} aria-label="Dismiss notification"><X size={16} aria-hidden="true" /></button></div>}
@@ -464,7 +721,7 @@ function Vault({ session, setSession, onLock, onLogout }: {
             <section className="inspector">{editing ? <ItemEditor key={editing === 'new' ? 'new' : editing.id} item={editing === 'new' ? null : editing} onSave={save} onCancel={() => setEditing(null)} busy={busy} /> : selected ? <ItemDetail key={selected.id} item={selected} onEdit={() => setEditing(selected)} onDelete={() => remove(selected)} onShared={shared} notify={notify} /> : <div className="inspector-empty"><LockSimple size={30} aria-hidden="true" /><h2>Select an item</h2><p>View and manage decrypted details here. Plaintext stays in this tab.</p></div>}</section>
           </div>}
           {tab === 'shares' && <SharesView shares={session.shares} items={session.items} onRevoke={revoke} />}
-          {tab === 'security' && <SecurityView onChangePassword={changePassword} busy={busy} />}
+          {tab === 'settings' && <SettingsView onChangePassword={changePassword} onRotateRecovery={replaceRecovery} onLock={onLock} onExportBackup={exportBackup} idleLockMinutes={idleLockMinutes} onIdleLockChange={onIdleLockChange} busy={busy} />}
         </main>
       </div>
     </div>
@@ -515,6 +772,7 @@ export default function App() {
   const [initialMode, setInitialMode] = useState<'register' | 'unlock'>('unlock');
   const [booting, setBooting] = useState(!window.location.pathname.startsWith('/share/'));
   const [bootError, setBootError] = useState('');
+  const [idleLockMinutes, setIdleLockMinutesState] = useState<IdleLockMinutes>(getIdleLockMinutes);
   const sessionRef = useRef<Session | null>(null);
   sessionRef.current = session;
   const setSession = useCallback((updater: (current: Session) => Session) => {
@@ -551,15 +809,16 @@ export default function App() {
 
   useEffect(() => {
     if (!session) return;
-    let timer = window.setTimeout(lock, 5 * 60 * 1000);
-    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lock, 5 * 60 * 1000); };
+    const delay = idleLockMinutes * 60 * 1000;
+    let timer = window.setTimeout(lock, delay);
+    const reset = () => { window.clearTimeout(timer); timer = window.setTimeout(lock, delay); };
     const events: (keyof WindowEventMap)[] = ['pointerdown', 'pointermove', 'keydown', 'scroll', 'touchstart'];
     events.forEach((event) => window.addEventListener(event, reset, { passive: true }));
     return () => { window.clearTimeout(timer); events.forEach((event) => window.removeEventListener(event, reset)); };
-  }, [session, lock]);
+  }, [session, lock, idleLockMinutes]);
 
   if (window.location.pathname.startsWith('/share/')) return <PublicShare />;
   if (booting) return <main className="loading-screen"><Wordmark /><p>Opening the secure threshold…</p></main>;
   if (!session) return <>{bootError && <div className="boot-error" role="alert">{bootError}<button onClick={() => setBootError('')} aria-label="Dismiss">×</button></div>}<AuthScreen key={`${initialMode}-${initialEmail}`} initialMode={initialMode} initialEmail={initialEmail} onRegistered={start} onUnlocked={start} /></>;
-  return <Vault session={session} setSession={setSession} onLock={lock} onLogout={async () => { try { await api.logout(); } finally { lock(); setInitialMode('unlock'); } }} />;
+  return <Vault session={session} setSession={setSession} onLock={lock} onLogout={async () => { try { await api.logout(); } finally { lock(); setInitialMode('unlock'); } }} idleLockMinutes={idleLockMinutes} onIdleLockChange={(minutes) => { setIdleLockMinutes(minutes); setIdleLockMinutesState(minutes); }} />;
 }

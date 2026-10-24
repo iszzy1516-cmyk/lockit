@@ -18,6 +18,7 @@ All encoded binary values use unpadded Base64url. Random values come from libsod
 | Identity key pair | Ed25519; private key wrapped locally |
 | Vault key pair | X25519; private key wrapped locally |
 | Private-key wrapping | XSalsa20-Poly1305 `crypto_secretbox`, independent random 24-byte nonces |
+| Recovery key | Random 256-bit client-generated key; wraps separate copies of private keys and exists only in the downloaded file |
 | Vault data key | Random 32 bytes, sealed with X25519 `crypto_box_seal` |
 | Item encryption | XChaCha20-Poly1305 IETF, random 24-byte nonce per save |
 | Item context binding | AAD `lockit-item-v1:<identity-public-key>:<item-uuid>` |
@@ -27,6 +28,8 @@ All encoded binary values use unpadded Base64url. Random values come from libsod
 | Share authorization | Random 32-byte token; HMAC-SHA256(pepper, `<share-id>.<token>`) stored |
 
 The complete item JSON—including title, username, secret, notes, URL, and document data—is encrypted. The stable Ed25519 public key is the account context for item AAD. Master-password changes generate a new salt and re-wrap only the two private keys; the public keys and sealed vault data key cannot change through the API.
+
+Registration also creates a random 256-bit recovery key locally. That key wraps separate copies of the Ed25519 and X25519 private keys, and the client downloads it as a recovery file. The server stores only the authenticated ciphertext boxes. Anyone with the file can recover the account's private keys, so the file must be kept offline and should be replaced from Settings if exposed. Rotation changes only the recovery-wrapped copies; master wrapping, identity keys, and the vault data key stay unchanged.
 
 A share is an encrypted snapshot, not live access. Its URL is `/share/<id>#<token>.<key>`. Browsers do not include the fragment in HTTP requests, so neither the authorization token nor decryption key appears in request paths or proxy access logs. The token is sent only in the JSON authorization request; the key remains in the recipient client. The database stores only the token HMAC and encrypted snapshot.
 
@@ -74,6 +77,7 @@ The native CLI uses `sodium_malloc`, requires `mlock` for sensitive buffers, and
 | Share guessing or replay after expiry | Expiry, revocation, constant-time HMAC comparison | Active link remains a bearer capability by design |
 | CSRF/XSS | SameSite cookies, Origin/Fetch checks, React escaping, CSP, HTTP(S)-only item links | Client supply-chain or browser extension compromise |
 | Brute force | Argon2id memory/time cost and login throttling | Weak master passwords and per-account throttling denial of service |
+| Recovery file theft | Random 256-bit key, ciphertext-only storage, explicit download custody, local rotation | Anyone holding the file and encrypted bundle can unlock; rotation cannot erase copied files |
 | HIBP credential disclosure | Local SHA-1 and five-character k-anonymity prefix | Prefix/IP/timing metadata; incomplete breach corpus |
 | Injection and path traversal | Parameterized SQLite, no shell execution, canonical static paths, strict routing | Native dependency and runtime vulnerabilities |
 | Key persistence in memory | Browser best effort; CLI locked buffers and cleanup | JavaScript copies, OS crash artifacts, compromised host |
@@ -95,7 +99,7 @@ Resolved during review:
 9. The CLI requires HTTPS for non-loopback servers and frees guarded allocations after wiping and unlocking them.
 10. Expired-data cleanup was moved from every request to a bounded once-per-minute schedule.
 
-The simulated review found no Critical or High-severity issue. Accepted limitations include account-existence disclosure through challenge/registration behavior, per-account throttling denial of service, offline password guessing, malicious client delivery, metadata visibility, ciphertext rollback, recipient copies, platform memory limits, and lack of MFA or password recovery. No real external auditor has certified these conclusions.
+The simulated review found no Critical or High-severity issue. Accepted limitations include account-existence disclosure through challenge/registration behavior, per-account throttling denial of service, offline password guessing, malicious client delivery, metadata visibility, ciphertext rollback, recipient copies, platform memory limits, recovery-file theft, and lack of MFA. No real external auditor has certified these conclusions.
 
 ## Verification evidence
 

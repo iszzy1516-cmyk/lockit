@@ -13,8 +13,10 @@ export type KeyBundle = {
   memLimit: number;
   identityPublicKey: string;
   encryptedIdentitySecret: SecretBox;
+  encryptedRecoveryIdentitySecret: SecretBox;
   vaultPublicKey: string;
   encryptedVaultSecret: SecretBox;
+  encryptedRecoveryVaultSecret: SecretBox;
   sealedVaultKey: string;
 };
 
