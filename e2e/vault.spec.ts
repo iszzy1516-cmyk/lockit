@@ -1,6 +1,19 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+
+async function captureScreenshots(page: Page, name: 'auth' | 'vault' | 'security') {
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.screenshot({ path: `test-results/${name}-desktop${colorScheme === 'dark' ? '-dark' : ''}.png`, fullPage: true, animations: 'disabled' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: `test-results/${name}-mobile${colorScheme === 'dark' ? '-dark' : ''}.png`, fullPage: true, animations: 'disabled' });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  }
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.setViewportSize({ width: 1440, height: 900 });
+}
 
 const master = 'first correct horse battery staple';
 const replacement = 'second correct horse battery staple';
@@ -22,6 +35,7 @@ test('real zero-knowledge vault workflow', async ({ page, context }) => {
   }));
 
   await page.goto('/');
+  await captureScreenshots(page, 'auth');
   await page.getByRole('tab', { name: 'Create vault' }).click();
   await page.getByLabel('Email address').fill('e2e@example.com');
   await page.locator('input[autocomplete="new-password"]').first().fill(master);
@@ -77,8 +91,11 @@ test('real zero-knowledge vault workflow', async ({ page, context }) => {
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download', exact: true }).click();
   expect((await downloadPromise).suggestedFilename()).toBe('recovery.txt');
+  await page.getByRole('button', { name: /Production login/ }).click();
+  await captureScreenshots(page, 'vault');
 
   await page.getByRole('button', { name: 'Security', exact: true }).click();
+  await captureScreenshots(page, 'security');
   await page.getByLabel('Current master password').fill(master);
   await page.getByLabel('New master password', { exact: true }).fill(replacement);
   await page.getByLabel('Confirm new master password').fill(replacement);
@@ -96,9 +113,7 @@ test('real zero-knowledge vault workflow', async ({ page, context }) => {
   await page.getByRole('button', { name: 'Reveal', exact: true }).click();
   await expect(page.getByText(password, { exact: true })).toBeVisible();
 
-  await page.screenshot({ path: 'test-results/vault-desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.screenshot({ path: 'test-results/vault-mobile.png', fullPage: true });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
   const network = requests.join('\n');

@@ -13,3 +13,7 @@ tests
 e2e
 docs
 *.log
+.tools
+src-tauri
+artifacts
+release

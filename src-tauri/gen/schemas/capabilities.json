@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core desktop functionality for the Lockit main window","local":true,"windows":["main"],"permissions":["core:default"]}}

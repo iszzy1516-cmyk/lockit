@@ -544,7 +544,7 @@ Desktop-specific checks:
 
 ```sh
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
-cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo clippy --release --manifest-path src-tauri/Cargo.toml -- -D warnings
 npm run desktop:build
 ```
 

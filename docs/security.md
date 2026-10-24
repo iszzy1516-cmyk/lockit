@@ -46,6 +46,12 @@ The browser computes SHA-1 locally and sends only the first five hexadecimal cha
 
 Checks are user initiated while the item is unlocked. A malicious server cannot perform plaintext background monitoring. “Not found” is not a promise that a password is safe; upstream failure returns an explicit unknown state. HIBP and the server can observe a hash prefix, source IP, timing, and repeated checks, which is a residual metadata risk.
 
+## Desktop trust boundary
+
+The Tauri application starts the same server on a random loopback port and opens it inside the desktop WebView. The server, client, official Node runtime, and encrypted SQLite database are local. The database and randomly generated share pepper live in the operating system's per-user Lockit data directory, not the public repository or installation directory. Node runtime downloads are checked against official SHA-256 checksums during packaging.
+
+Other local processes can attempt to reach the loopback port, but still need the authenticated session and must pass Origin and Fetch Metadata checks for mutations. A compromised user account or WebView remains outside the security boundary. Desktop share links are useful on that local instance; sharing with other devices requires a deliberately deployed TLS server.
+
 ## Secure memory boundaries
 
 Browser keys are held only in memory, not localStorage or IndexedDB. Lock, logout, failed unlock, and unmount trigger best-effort `sodium.memzero`; temporary key-encryption keys and plaintext byte arrays are wiped after use. The browser locks after five minutes without activity.

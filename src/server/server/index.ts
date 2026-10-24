@@ -90,7 +90,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     hibpBaseUrl: !production && env.HIBP_BASE_URL
       ? env.HIBP_BASE_URL.replace(/\/$/, '')
       : 'https://api.pwnedpasswords.com',
-    publicDir: path.resolve('dist/public'),
+    publicDir: path.resolve(env.LOCKIT_PUBLIC_DIR ?? 'dist/public'),
   };
 }
 
