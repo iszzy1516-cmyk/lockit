@@ -1,0 +1,37 @@
+{
+  "name": "lockit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A zero-knowledge password and secrets vault",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run typecheck && tsc -p tsconfig.server.json && tsc -p tsconfig.cli.json && vite build",
+    "start": "node dist/server/server/index.js",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json && tsc -p tsconfig.cli.json --noEmit",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:e2e": "playwright test",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:e2e",
+    "cli": "tsx src/cli/index.ts"
+  },
+  "dependencies": {
+    "libsodium-wrappers-sumo": "^0.7.15",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "sodium-native": "^5.0.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@types/sodium-native": "^2.3.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}

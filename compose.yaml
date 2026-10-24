@@ -1,0 +1,48 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOCKIT_DB_PATH: /data/lockit.db
+      LOCKIT_PUBLIC_ORIGIN: ${LOCKIT_PUBLIC_ORIGIN:?set an HTTPS origin}
+      LOCKIT_SHARE_PEPPER: ${LOCKIT_SHARE_PEPPER:?set a random secret of at least 32 bytes}
+      LOCKIT_TRUST_PROXY: "true"
+    volumes:
+      - vault-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      LOCKIT_PUBLIC_ORIGIN: ${LOCKIT_PUBLIC_ORIGIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  vault-data:
+  caddy-data:
+  caddy-config:
